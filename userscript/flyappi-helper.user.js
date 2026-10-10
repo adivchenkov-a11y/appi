@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FlyAPPI Instructor Helper
 // @namespace    flyappi-automation
-// @version      2.0.3
+// @version      2.0.4
 // @description  Issue APPI pilot levels on flyappi.org for one or many pilots at once, from your own logged-in session.
 // @match        https://flyappi.org/*
 // @match        https://www.flyappi.org/*
@@ -15,7 +15,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '2.0.3'; // keep equal to @version (checked by scripts/pack-userscript.js)
+  const VERSION = '2.0.4'; // keep equal to @version (checked by scripts/pack-userscript.js)
   const BASE_URL = location.origin;
   const AJAX_HEADERS = { 'X-Requested-With': 'XMLHttpRequest' };
   const GET_TIMEOUT_MS = 60000;
@@ -116,6 +116,22 @@
 
   const ajaxGetJson = (urlPath) => request(urlPath);
 
+  // Single requests sometimes stall for a minute on the site's side while the
+  // same request, repeated, answers in 5 s (seen on /ajaxWorkshopExam/ with no
+  // video running). Pure reads are therefore cut off early and asked again.
+  // Never used for calls that change something.
+  const READ_TIMEOUT_MS = 25000;
+  const READ_ATTEMPTS = 3;
+  async function ajaxRead(urlPath) {
+    for (let attempt = 1; ; attempt++) {
+      try {
+        return await request(urlPath, { timeout: READ_TIMEOUT_MS });
+      } catch (err) {
+        if (attempt >= READ_ATTEMPTS || !/did not answer|network error/.test(err.message)) throw err;
+      }
+    }
+  }
+
   /** True for a refusal that may pass later: gateway errors, or nginx itself saying 403. */
   async function isTemporaryRefusal(res) {
     if ([502, 503, 504].includes(res.status)) return true;
@@ -194,7 +210,7 @@
   // ---------------------------------------------------------------------------
 
   async function searchMemberByLicense(licenseNumber) {
-    const data = await ajaxGetJson(`/ajaxSearchItem/AllMember/${encodeURIComponent(licenseNumber)}/None/?_=${Date.now()}`);
+    const data = await ajaxRead(`/ajaxSearchItem/AllMember/${encodeURIComponent(licenseNumber)}/None/?_=${Date.now()}`);
     // The site's search is fuzzy and happily returns near-misses, so a typo would
     // otherwise silently open (and certify) a different pilot. Only an exact
     // license-number match is ever accepted.
@@ -264,7 +280,7 @@
 
   /** The pilot's levels. The site renders this server-side in ~4 s - read it as rarely as possible. */
   async function getCertifyPanel(memberId) {
-    const data = await ajaxGetJson(`/ajaxCertifyAMember/${memberId}/0/?_=${Date.now()}`);
+    const data = await ajaxRead(`/ajaxCertifyAMember/${memberId}/0/?_=${Date.now()}`);
     const doc = parseHtml(data.html);
     const bySkillId = new Map();
 
@@ -304,7 +320,7 @@
 
   /** A level's checklist ("workshop practical exam tool"). */
   async function getWorkshopExam(memberId, skillId) {
-    const data = await ajaxGetJson(`/ajaxWorkshopExam/${memberId}/0/${skillId}/?_=${Date.now()}`);
+    const data = await ajaxRead(`/ajaxWorkshopExam/${memberId}/0/${skillId}/?_=${Date.now()}`);
     const doc = parseHtml(data.html);
     const byItemId = new Map();
 

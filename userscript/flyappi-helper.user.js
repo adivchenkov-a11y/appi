@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FlyAPPI Instructor Helper
 // @namespace    flyappi-automation
-// @version      2.0.1
+// @version      2.0.2
 // @description  Issue APPI pilot levels on flyappi.org for one or many pilots at once, from your own logged-in session.
 // @match        https://flyappi.org/*
 // @match        https://www.flyappi.org/*
@@ -15,7 +15,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '2.0.1'; // keep equal to @version (checked by scripts/pack-userscript.js)
+  const VERSION = '2.0.2'; // keep equal to @version (checked by scripts/pack-userscript.js)
   const BASE_URL = location.origin;
   const AJAX_HEADERS = { 'X-Requested-With': 'XMLHttpRequest' };
   const GET_TIMEOUT_MS = 60000;
@@ -794,7 +794,6 @@
     summary { cursor: pointer; font-size: 13px; color: var(--muted); padding: 4px 0; }
     .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
     .chip { padding: 6px 12px; border-radius: 16px; border: 1px solid var(--border); background: var(--soft); cursor: pointer; font-size: 13px; }
-    .legend { margin: 4px 0; padding-left: 18px; font-size: 13px; line-height: 1.7; }
     .hint { font-size: 12px; color: var(--muted); }
     .picker { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; align-items: center; }
     .picker .hint { width: 100%; }
@@ -859,14 +858,6 @@
     const runBtn = el('button', { className: 'btn primary', textContent: 'Run', disabled: true });
     const statusText = el('span', { className: 'hint' });
 
-    const legend = el('ul', { className: 'legend' });
-    for (const line of [
-      '✅ level issued   🔒 level not yet unlocked on the site',
-      '🎓 exam passed   ⏳ exam sent, student has not finished   📨 exam not sent yet',
-      '📗 file uploaded   📎 file missing - upload it with the button in the pilot\'s card',
-      '❌ error from the site (tap for the full text)',
-    ]) legend.append(el('li', { textContent: line }));
-
     panel.append(
       el('div', { className: 'head' }, el('b', { textContent: 'FlyAPPI Helper' }), el('span', { className: 'ver', textContent: `v${VERSION}` }), closeBtn),
       el(
@@ -874,7 +865,6 @@
         { className: 'body' },
         el('div', { className: 'search' }, input, findBtn),
         el('details', { open: true }, el('summary', { textContent: 'Recent licenses' }), recentBox),
-        el('details', {}, el('summary', { textContent: 'What the icons mean' }), legend),
         pickerBox,
         cardsBox,
         el('details', {}, el('summary', { textContent: 'Log' }), logBox)

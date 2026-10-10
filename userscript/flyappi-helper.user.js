@@ -1,12 +1,12 @@
 // ==UserScript==
 // @name         FlyAPPI Instructor Helper
 // @namespace    flyappi-automation
-// @version      2.0.0
+// @version      2.0.1
 // @description  Issue APPI pilot levels on flyappi.org for one or many pilots at once, from your own logged-in session.
 // @match        https://flyappi.org/*
 // @match        https://www.flyappi.org/*
 // @noframes
-// @run-at       document-idle
+// @run-at       document-start
 // @grant        none
 // @updateURL    https://raw.githubusercontent.com/adivchenkov-a11y/appi/main/userscript/flyappi-helper.meta.js
 // @downloadURL  https://raw.githubusercontent.com/adivchenkov-a11y/appi/main/userscript/flyappi-helper.user.js
@@ -15,7 +15,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '2.0.0'; // keep equal to @version (checked by scripts/pack-userscript.js)
+  const VERSION = '2.0.1'; // keep equal to @version (checked by scripts/pack-userscript.js)
   const BASE_URL = location.origin;
   const AJAX_HEADERS = { 'X-Requested-With': 'XMLHttpRequest' };
   const GET_TIMEOUT_MS = 60000;
@@ -160,17 +160,32 @@
    * The home page streams a background video over the same connection as our
    * requests, and while it downloads they can stall for a minute or more
    * (measured: 3 of 4 loads timed out on /home/, none once it was stopped).
-   * Removing the source is what actually stops the download - pause() alone does not.
+   * The video is not needed here, so it is stopped for good: now, and every
+   * time the site adds or starts one. Removing the source is what actually
+   * stops the download - pause() alone does not.
    */
-  function stopPageVideos() {
-    document.querySelectorAll('video').forEach((video) => {
-      if (!video.currentSrc && !video.src) return;
-      video.pause();
-      video.removeAttribute('src');
-      video.querySelectorAll('source').forEach((s) => s.remove());
-      video.load();
-    });
+  function killVideo(video) {
+    if (video.dataset.fhStopped) return;
+    video.dataset.fhStopped = '1';
+    video.autoplay = false;
+    video.preload = 'none';
+    video.pause();
+    video.removeAttribute('src');
+    video.querySelectorAll('source').forEach((s) => s.remove());
+    video.load();
   }
+
+  function stopPageVideos() {
+    document.querySelectorAll('video').forEach(killVideo);
+  }
+
+  // At document-start the root element may not exist yet; wait for it.
+  function watchVideos() {
+    if (!document.documentElement) return setTimeout(watchVideos, 0);
+    new MutationObserver(stopPageVideos).observe(document.documentElement, { childList: true, subtree: true });
+    stopPageVideos();
+  }
+  watchVideos();
 
   const parseHtml = (html) => new DOMParser().parseFromString(html, 'text/html');
 
@@ -1076,7 +1091,6 @@
     // own, so they can be added for several pilots one after another.
     async function uploadFor(pilot, skill, file) {
       if (busy || pilot.busy) return;
-      stopPageVideos();
       pilot.busy = '⏳ uploading file...';
       pilot.uploading = skill.label;
       render();
@@ -1099,7 +1113,6 @@
       }
       store(INPUT_KEY, input.value, sessionStorage);
       input.blur(); // hide the phone keyboard so the cards are visible
-      stopPageVideos();
       busy = true;
       pilots = licenses.map((license) => ({ license, skills: [], targets: [], checked: new Set(), busy: 'loading...' }));
       render();
@@ -1128,7 +1141,6 @@
 
     async function run() {
       if (anyBusy()) return;
-      stopPageVideos();
       busy = true;
       const todo = pilots.filter((p) => p.checked.size);
       for (const p of todo) p.busy = '⏳ queued';

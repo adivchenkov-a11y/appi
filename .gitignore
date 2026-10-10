@@ -5,3 +5,4 @@
 !/userscript/
 /userscript/*
 !/userscript/flyappi-helper.user.js
+!/userscript/flyappi-helper.meta.js

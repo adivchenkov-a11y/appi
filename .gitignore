@@ -1,0 +1,7 @@
+# Only the userscript is published (for auto-update). Everything else stays local.
+/*
+!/.gitignore
+!/README.md
+!/userscript/
+/userscript/*
+!/userscript/flyappi-helper.user.js

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FlyAPPI Instructor Helper
 // @namespace    flyappi-automation
-// @version      2.0.2
+// @version      2.0.3
 // @description  Issue APPI pilot levels on flyappi.org for one or many pilots at once, from your own logged-in session.
 // @match        https://flyappi.org/*
 // @match        https://www.flyappi.org/*
@@ -15,7 +15,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '2.0.2'; // keep equal to @version (checked by scripts/pack-userscript.js)
+  const VERSION = '2.0.3'; // keep equal to @version (checked by scripts/pack-userscript.js)
   const BASE_URL = location.origin;
   const AJAX_HEADERS = { 'X-Requested-With': 'XMLHttpRequest' };
   const GET_TIMEOUT_MS = 60000;
@@ -1031,7 +1031,8 @@
       const files = el('div', { className: 'files' });
       for (const skill of pilot.skills.filter((s) => s.needsFile && s.currentStatus !== 'validated')) {
         if (pilot.uploading === skill.label) {
-          files.append(el('span', { className: 'file-btn file-busy', textContent: `⏳ Uploading... · ${skill.label}` }));
+          const text = pilot.uploaded ? `✅ File uploaded, refreshing... · ${skill.label}` : `⏳ Uploading... · ${skill.label}`;
+          files.append(el('span', { className: 'file-btn file-busy', textContent: text }));
           continue;
         }
         const locked = busy || Boolean(pilot.busy);
@@ -1066,9 +1067,9 @@
       return [...[...best.values()].map((t) => t.slug), ...loose];
     }
 
-    async function runTarget(pilot, slug, file) {
+    async function runTarget(pilot, slug, file, onLog = log) {
       try {
-        const out = await applyTarget(pilot.license, slug, { file, onLog: log });
+        const out = await applyTarget(pilot.license, slug, { file, onLog });
         setPilot(pilot, out.pilot); // fresh state comes back with the result
         return out.results;
       } catch (err) {
@@ -1085,10 +1086,20 @@
       pilot.uploading = skill.label;
       render();
       try {
-        pilot.results = await runTarget(pilot, skill.slug, file);
+        // Once the site has taken the file, what remains is re-reading the pilot.
+        const onLog = (message, level) => {
+          log(message, level);
+          if (/document uploaded/.test(message)) {
+            pilot.uploaded = true;
+            pilot.busy = '⏳ refreshing pilot...';
+            render();
+          }
+        };
+        pilot.results = await runTarget(pilot, skill.slug, file, onLog);
       } finally {
         pilot.busy = undefined;
         pilot.uploading = undefined;
+        pilot.uploaded = false;
         render();
       }
     }

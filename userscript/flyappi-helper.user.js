@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FlyAPPI Instructor Helper
 // @namespace    flyappi-automation
-// @version      2.1.0
+// @version      2.1.1
 // @description  Issue APPI pilot levels on flyappi.org for one or many pilots at once, from your own logged-in session.
 // @match        https://flyappi.org/*
 // @match        https://www.flyappi.org/*
@@ -15,7 +15,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '2.1.0'; // keep equal to @version (checked by scripts/pack-userscript.js)
+  const VERSION = '2.1.1'; // keep equal to @version (checked by scripts/pack-userscript.js)
   const BASE_URL = location.origin;
   const AJAX_HEADERS = { 'X-Requested-With': 'XMLHttpRequest' };
   const GET_TIMEOUT_MS = 60000;
@@ -627,7 +627,7 @@
       )
     );
     const itemsBySkillId = new Map(checklists);
-    const exams = visible.some((s) => s.exam && !s.exam.isPassed) ? await knownExams(licenseNumber) : [];
+    const exams = visible.some((s) => s.exam) ? await knownExams(licenseNumber) : [];
 
     const skills = visible.map((s) => {
       const documents = (itemsBySkillId.get(s.skillId) || [])
@@ -644,15 +644,26 @@
       };
     });
 
-    return { member, licenseNumber, skills, targets: buildTargets(visible) };
+    return { member, licenseNumber, skills, targets: buildTargets(visible.map((s) => ({ ...s, exam: withKnownExams(s.exam, exams) }))) };
   }
 
-  /** An exam opened for the same or a higher level covers this one: show it as waiting, not as "not sent". */
+  /**
+   * Which exam stands behind a level's exam row. The instructor's exam list is asked
+   * first (it also shows exams opened for a HIGHER level); when the pilot is not in it,
+   * the row from the pilot's own panel is all there is.
+   */
   function withKnownExams(exam, exams) {
-    if (!exam || exam.isPassed) return exam;
+    if (!exam) return exam;
     const own = examRank(exam.examName);
-    const cover = exams.filter(isOpenExam).filter((e) => examRank(e.name) >= own).sort((a, b) => examRank(b.name) - examRank(a.name))[0];
-    return cover ? { ...exam, needsSending: false, waitingFor: cover.name } : { ...exam, waitingFor: exam.needsSending ? null : exam.examName };
+    const higherFirst = (a, b) => examRank(b.name) - examRank(a.name);
+    const covering = exams.filter((e) => examRank(e.name) >= own).sort(higherFirst);
+    if (exam.isPassed) {
+      const done = covering.find((e) => EXAM_DONE.has(e.status));
+      return done ? { ...exam, passedLevel: done.name } : exam;
+    }
+    const open = covering.find(isOpenExam);
+    if (open) return { ...exam, needsSending: false, waitingFor: open.name };
+    return { ...exam, waitingFor: exam.needsSending ? null : exam.examName };
   }
 
   async function findPilot(licenseNumber) {
@@ -1047,7 +1058,14 @@
     });
 
     const parseLicenses = (text) => [...new Set(text.split(/[\s,;]+/).map((s) => s.trim()).filter(Boolean))];
-    const examIcon = (exam) => (!exam ? '' : exam.isPassed ? ' 🎓' : exam.needsSending ? ' 📨' : ' ⏳');
+    const examShort = (name) => String(name || '').replace(/^(APPI \d).*/i, '$1');
+    // In the plan line: which level the exam is for, when it is not the level's own one.
+    const examIcon = (exam) => {
+      if (!exam) return '';
+      if (exam.isPassed) return exam.passedLevel && examRank(exam.passedLevel) !== examRank(exam.examName) ? ` 🎓 (${examShort(exam.passedLevel)})` : ' 🎓';
+      if (exam.needsSending) return ' 📨';
+      return exam.waitingFor && examRank(exam.waitingFor) !== examRank(exam.examName) ? ` ⏳ (${examShort(exam.waitingFor)})` : ' ⏳';
+    };
     const planText = (plan) => plan.map((s) => `${s.visible ? '' : '🔒 '}${s.label}${examIcon(s.exam)}`).join(' → ');
 
     async function pool(items, worker, limit) {
@@ -1166,9 +1184,9 @@
         if (skill.exam) {
           const e = skill.exam;
           const [cls, text] = e.coveredByBetter
-            ? ['ok', '🎓 covered by a higher exam']
+            ? ['ok', `🎓 covered by ${e.passedLevel ? `exam ${e.passedLevel}` : 'a higher exam'}`]
             : e.isPassed
-              ? ['ok', '🎓 exam passed']
+              ? ['ok', `🎓 exam passed${e.passedLevel && examRank(e.passedLevel) !== examRank(e.examName) ? ` (${e.passedLevel})` : ''}`]
               : e.needsSending
                 ? ['err', '📨 exam not sent']
                 : ['wait', `⏳ waiting for exam${e.waitingFor ? ` ${e.waitingFor}` : ''}`];

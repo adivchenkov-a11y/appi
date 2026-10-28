@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FlyAPPI Instructor Helper
 // @namespace    flyappi-automation
-// @version      2.1.2
+// @version      2.1.3
 // @description  Issue APPI pilot levels on flyappi.org for one or many pilots at once, from your own logged-in session.
 // @match        https://flyappi.org/*
 // @match        https://www.flyappi.org/*
@@ -15,7 +15,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '2.1.2'; // keep equal to @version (checked by scripts/pack-userscript.js)
+  const VERSION = '2.1.3'; // keep equal to @version (checked by scripts/pack-userscript.js)
   const BASE_URL = location.origin;
   const AJAX_HEADERS = { 'X-Requested-With': 'XMLHttpRequest' };
   const GET_TIMEOUT_MS = 60000;
@@ -1080,8 +1080,16 @@
     setInterval(() => pilots.forEach((p) => p.busy && paintBusy(p)), 1000);
 
     // A phone freezes pages in the background: say so instead of leaving a silent, stuck status.
+    // Short absences (the file picker, a quick app switch) do not count.
+    let hiddenAt = null;
     document.addEventListener('visibilitychange', () => {
-      if (document.visibilityState === 'visible' && anyBusy()) {
+      if (document.visibilityState === 'hidden') {
+        hiddenAt = Date.now();
+        return;
+      }
+      const away = hiddenAt ? Date.now() - hiddenAt : 0;
+      hiddenAt = null;
+      if (away >= 30000 && anyBusy()) {
         log('The page was in the background - if a step stays stuck, it was interrupted: press Find to reload the state.', 'warn');
       }
     });
@@ -1236,7 +1244,7 @@
       if (info.childNodes.length) card.append(info);
 
       const files = el('div', { className: 'files' });
-      for (const skill of pilot.skills.filter((s) => s.needsFile && s.currentStatus !== 'validated')) {
+      for (const skill of pilot.skills.filter((s) => (s.needsFile || pilot.uploading === s.label) && s.currentStatus !== 'validated')) {
         if (pilot.uploading === skill.label) {
           const text = pilot.uploaded ? `✅ File uploaded, issuing the level... · ${skill.label}` : `⏳ Uploading... · ${skill.label}`;
           files.append(el('span', { className: 'file-btn file-busy', textContent: text }));
@@ -1303,6 +1311,12 @@
           return;
         }
         pilot.uploaded = true;
+        // The card is re-read only at the end of the issuing - show the upload now.
+        const uploadedSkill = pilot.skills.find((s) => s.label === skill.label);
+        if (uploadedSkill) {
+          uploadedSkill.documents = uploadedSkill.documents.map((d) => ({ ...d, done: true }));
+          uploadedSkill.needsFile = false;
+        }
         render();
         const issued = await runTarget(pilot, skill.slug, null);
         pilot.results = [{ skillLabel: skill.label, status: 'ok', message: 'file uploaded', fileUploaded: true }, ...issued];

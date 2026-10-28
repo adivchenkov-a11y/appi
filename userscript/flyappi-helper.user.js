@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FlyAPPI Instructor Helper
 // @namespace    flyappi-automation
-// @version      2.1.1
+// @version      2.1.2
 // @description  Issue APPI pilot levels on flyappi.org for one or many pilots at once, from your own logged-in session.
 // @match        https://flyappi.org/*
 // @match        https://www.flyappi.org/*
@@ -15,7 +15,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '2.1.1'; // keep equal to @version (checked by scripts/pack-userscript.js)
+  const VERSION = '2.1.2'; // keep equal to @version (checked by scripts/pack-userscript.js)
   const BASE_URL = location.origin;
   const AJAX_HEADERS = { 'X-Requested-With': 'XMLHttpRequest' };
   const GET_TIMEOUT_MS = 60000;
@@ -875,6 +875,42 @@
     return { results, pilot: await buildView(member, licenseNumber, finalPanel) };
   }
 
+  /**
+   * Upload button: the file goes straight to the row of THIS level that asks for it
+   * (APPI 3's BESAFE procedure, or the level's own document) - before any issuing,
+   * so that a lower level that cannot be issued yet never keeps the file from
+   * arriving. Returns how many rows got it.
+   */
+  async function uploadLevelFile(licenseNumber, skillLabel, file, { onLog } = {}) {
+    const log = (message, level = 'info') => onLog?.(`[${licenseNumber}] ${message}`, level);
+    log('reading the pilot...', 'step');
+    const member = await getMember(licenseNumber);
+    const panel = await getCertifyPanel(member.memberId);
+    const skill = findSkill(panel, skillLabel);
+    if (!skill) throw new FlyappiError(`level "${skillLabel}" is not available for this pilot`);
+    let uploaded = 0;
+    if (skill.hasWorkshopTool) {
+      log(`${skill.label}: reading checklist...`, 'step');
+      const { items } = await getWorkshopExam(member.memberId, skill.skillId);
+      for (const item of items) {
+        if (!item.needsDocument || item.currentStatus === 'validated' || isInheritedDocument(item.label, skill.label)) continue;
+        log(`${skill.label}: uploading ${item.label}...`, 'step');
+        await uploadDocument({ memberId: member.memberId, skillId: item.itemId, targetStatus: 'validated', file, mySkillId: item.mySkillId });
+        log(`  📎 ${item.label} - document uploaded`, 'ok');
+        uploaded += 1;
+      }
+    }
+    // A level-wide document is only asked for when no checklist row needs one (same rule as the card).
+    if (!uploaded && skill.hasDocumentUpload && skill.currentStatus !== 'validated') {
+      log(`${skill.label}: uploading document...`, 'step');
+      await uploadDocument({ memberId: member.memberId, skillId: skill.skillId, targetStatus: 'validated', file, mySkillId: skill.mySkillId });
+      log(`  📎 ${skill.label} - document uploaded`, 'ok');
+      uploaded += 1;
+    }
+    if (!uploaded) throw new FlyappiError('this level does not ask for a file any more');
+    return uploaded;
+  }
+
   // ---------------------------------------------------------------------------
   // UI: a panel over the site, inside a shadow root so neither the site's CSS
   // nor ours leaks into the other. Phone: full screen. Computer: side drawer.
@@ -1118,7 +1154,8 @@
       if (r.some((x) => x.missingFiles?.length)) parts.push('📎 needs file');
       if (r.some((x) => x.status === 'pending' && /not unlocked/.test(x.message))) parts.push('🔒 next level not unlocked yet');
       if (!parts.length) parts.push(r.length ? '✅ done' : '✅ nothing to do');
-      const cls = errors.length ? 'err' : parts[0].startsWith('✅') ? 'ok' : 'wait';
+      if (r.some((x) => x.fileUploaded)) parts.unshift('📗 file uploaded');
+      const cls = errors.length ? 'err' : r.some((x) => x.status === 'pending') ? 'wait' : 'ok';
       return { cls, text: parts.join(' · '), title };
     }
 
@@ -1201,7 +1238,7 @@
       const files = el('div', { className: 'files' });
       for (const skill of pilot.skills.filter((s) => s.needsFile && s.currentStatus !== 'validated')) {
         if (pilot.uploading === skill.label) {
-          const text = pilot.uploaded ? `✅ File uploaded, refreshing... · ${skill.label}` : `⏳ Uploading... · ${skill.label}`;
+          const text = pilot.uploaded ? `✅ File uploaded, issuing the level... · ${skill.label}` : `⏳ Uploading... · ${skill.label}`;
           files.append(el('span', { className: 'file-btn file-busy', textContent: text }));
           continue;
         }
@@ -1248,28 +1285,27 @@
       }
     }
 
-    // A file goes with the level whose button was pressed; uploads run on their
-    // own, so they can be added for several pilots one after another.
+    // Upload button: first the file goes to this level's document row, then the
+    // pilot is brought to that level as Run would do. A failed upload issues nothing.
     async function uploadFor(pilot, skill, file) {
       if (busy || pilot.busy) return;
       pilot.busy = '⏳ uploading file...';
-      pilot.step = 'uploading file...';
+      pilot.step = `${skill.label}: uploading file...`;
       pilot.stepAt = Date.now();
       pilot.uploading = skill.label;
       render();
       try {
-        // Once the site has taken the file, what remains is re-reading the pilot.
-        const onLog = (message, level) => {
-          log(message, level);
-          if (/document uploaded/.test(message)) {
-            pilot.uploaded = true;
-            pilot.busy = '⏳ refreshing pilot...';
-            pilot.step = 'file uploaded, refreshing the pilot...';
-            pilot.stepAt = Date.now();
-            render();
-          }
-        };
-        pilot.results = await runTarget(pilot, skill.slug, file, onLog);
+        try {
+          await uploadLevelFile(pilot.license, skill.label, file, { onLog: log });
+        } catch (err) {
+          log(`[${pilot.license}] ${skill.label}: file upload failed - ${err.message}`, 'error');
+          pilot.results = [{ skillLabel: skill.label, status: 'error', message: `file upload failed - ${err.message}` }];
+          return;
+        }
+        pilot.uploaded = true;
+        render();
+        const issued = await runTarget(pilot, skill.slug, null);
+        pilot.results = [{ skillLabel: skill.label, status: 'ok', message: 'file uploaded', fileUploaded: true }, ...issued];
       } finally {
         pilot.busy = undefined;
         pilot.step = undefined;

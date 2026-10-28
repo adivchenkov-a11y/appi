@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FlyAPPI Instructor Helper
 // @namespace    flyappi-automation
-// @version      2.0.4
+// @version      2.1.0
 // @description  Issue APPI pilot levels on flyappi.org for one or many pilots at once, from your own logged-in session.
 // @match        https://flyappi.org/*
 // @match        https://www.flyappi.org/*
@@ -15,7 +15,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '2.0.4'; // keep equal to @version (checked by scripts/pack-userscript.js)
+  const VERSION = '2.1.0'; // keep equal to @version (checked by scripts/pack-userscript.js)
   const BASE_URL = location.origin;
   const AJAX_HEADERS = { 'X-Requested-With': 'XMLHttpRequest' };
   const GET_TIMEOUT_MS = 60000;
@@ -74,6 +74,17 @@
   // APPI 3 needs ONE of these ratings; the first is what gets issued by default.
   const APPI3_RATINGS = ['dynamic_soaring', 'thermalling'];
   const MAX_STEPS = 6;
+
+  // Online exams. A higher exam covers the lower ones: once it is passed the site
+  // marks the lower levels' exams "has_better_exam". So for a target level only the
+  // target's own exam is sent - never the intermediate ones one after another.
+  const EXAM_LEVELS = ['APPI 2 Explore', 'APPI 3 Pilot', 'APPI 4 Progress', 'APPI 5 Advanced'];
+  const EXAM_BY_SLUG = { appi_2_explore: 'APPI 2 Explore', appi_3_pilot: 'APPI 3 Pilot', appi_4_progress: 'APPI 4 Progress' };
+  const examRank = (name) => EXAM_LEVELS.findIndex((e) => e.toLowerCase() === String(name || '').trim().toLowerCase());
+  const EXAM_DONE = new Set(['passed', 'has_better_exam']);
+  const EXAM_LIST_SIZE = 300; // newest first; an exam still being worked on is always among the latest
+  const SENT_EXAMS_KEY = 'flyappi_helper_sent_exams';
+  const SENT_EXAM_TTL_MS = 3 * 24 * 3600 * 1000;
 
   class FlyappiError extends Error {}
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -273,7 +284,8 @@
     return {
       examName,
       status, // 'to_give' | 'passed' | anything else == sent, awaiting the student
-      isPassed: status === 'passed',
+      isPassed: EXAM_DONE.has(status),
+      coveredByBetter: status === 'has_better_exam',
       needsSending: Boolean(sendBtn) || status === 'to_give',
     };
   }
@@ -498,6 +510,55 @@
   }
 
   // ---------------------------------------------------------------------------
+  // Exams already on record for a pilot. The certify panel only shows the exam of
+  // each visible level, so an exam opened for a HIGHER level (by this tool or by
+  // hand on the site) is invisible there; the instructor's exam list shows it.
+  // ---------------------------------------------------------------------------
+
+  const normStatus = (s) => String(s || '').trim().toLowerCase().replace(/\s+/g, '_');
+  let examListCache = null;
+
+  async function getStudentExams() {
+    if (examListCache && Date.now() - examListCache.at < 60000) return examListCache.byLicense;
+    const byLicense = new Map();
+    let ok = false;
+    try {
+      const res = await request(`/dashboard/students_exams/0/${EXAM_LIST_SIZE}/id_inv/status/`, { timeout: 40000, read: 'response' });
+      if (res.ok) {
+        const doc = parseHtml(await res.text());
+        doc.querySelectorAll('div.row.small').forEach((row) => {
+          const cells = [...row.children].map((c) => c.textContent.replace(/\s+/g, ' ').trim());
+          const [type, name, status, license] = cells;
+          if (type !== 'exam' || !/^\d+$/.test(license || '') || examRank(name) < 0) return;
+          if (!byLicense.has(license)) byLicense.set(license, []);
+          byLicense.get(license).push({ name, status: normStatus(status) });
+        });
+        ok = true;
+      }
+    } catch {
+      /* the list is an extra source - fall back to the panel and our own record */
+    }
+    examListCache = { at: ok ? Date.now() : 0, byLicense };
+    return byLicense;
+  }
+
+  const recordSentExam = (license, name) => {
+    const all = loadStored(SENT_EXAMS_KEY, {});
+    all[license] = [...(all[license] || []).filter((e) => e.name !== name), { name, at: Date.now() }];
+    store(SENT_EXAMS_KEY, all);
+    examListCache = null; // the list has changed
+  };
+
+  /** Exams known for this pilot: the site's list plus what this tool sent recently (the list can lag). */
+  async function knownExams(license) {
+    const fromSite = (await getStudentExams()).get(String(license)) || [];
+    const mine = (loadStored(SENT_EXAMS_KEY, {})[license] || []).filter((e) => Date.now() - e.at < SENT_EXAM_TTL_MS);
+    return [...fromSite, ...mine.filter((e) => !fromSite.some((x) => x.name === e.name)).map((e) => ({ name: e.name, status: 'to_take' }))];
+  }
+
+  const isOpenExam = (e) => !EXAM_DONE.has(e.status) && !/fail|expire|cancel|hidden/.test(e.status);
+
+  // ---------------------------------------------------------------------------
   // Plans and issuing - same as the desktop app's pilotSession.js.
   // ---------------------------------------------------------------------------
 
@@ -566,6 +627,7 @@
       )
     );
     const itemsBySkillId = new Map(checklists);
+    const exams = visible.some((s) => s.exam && !s.exam.isPassed) ? await knownExams(licenseNumber) : [];
 
     const skills = visible.map((s) => {
       const documents = (itemsBySkillId.get(s.skillId) || [])
@@ -576,13 +638,21 @@
         label: s.label,
         slug: s.slug,
         currentStatus: s.currentStatus,
-        exam: s.exam,
+        exam: withKnownExams(s.exam, exams),
         documents,
         needsFile: documents.some((d) => !d.done),
       };
     });
 
     return { member, licenseNumber, skills, targets: buildTargets(visible) };
+  }
+
+  /** An exam opened for the same or a higher level covers this one: show it as waiting, not as "not sent". */
+  function withKnownExams(exam, exams) {
+    if (!exam || exam.isPassed) return exam;
+    const own = examRank(exam.examName);
+    const cover = exams.filter(isOpenExam).filter((e) => examRank(e.name) >= own).sort((a, b) => examRank(b.name) - examRank(a.name))[0];
+    return cover ? { ...exam, needsSending: false, waitingFor: cover.name } : { ...exam, waitingFor: exam.needsSending ? null : exam.examName };
   }
 
   async function findPilot(licenseNumber) {
@@ -604,6 +674,7 @@
    */
   async function certifyLevel(memberId, selection, status, log, panel) {
     const { skillLabel, file } = selection;
+    const step = (text) => log(text, 'step');
     const steps = [];
     const missingFiles = [];
     let waitingForExam = false;
@@ -613,28 +684,46 @@
     const skillId = startSkill.skillId;
 
     if (startSkill.currentStatus === status) {
-      return { steps: [`already ${status}`], waitingForExam, missingFiles, panel, fresh: true };
+      return { steps: [`already ${status}`], waitingForExam, waitingFor: null, missingFiles, panel, fresh: true };
     }
 
+    let waitingFor = null;
     if (startSkill.exam && !startSkill.exam.isPassed) {
-      if (startSkill.exam.needsSending) {
-        await sendExam(startSkill.exam.examName, memberId);
-        log(`  📨 exam "${startSkill.exam.examName}" sent to the student`);
-        steps.push('exam sent');
+      // One exam for the whole target: wanted = the target's exam, never lower than this level's own.
+      const own = examRank(startSkill.exam.examName);
+      const wantRank = Math.max(own, selection.targetExam ? examRank(selection.targetExam) : -1);
+      const wanted = wantRank >= 0 ? EXAM_LEVELS[wantRank] : startSkill.exam.examName;
+      const exams = await knownExams(selection.license);
+      const covering = exams.filter((e) => examRank(e.name) >= wantRank).sort((a, b) => examRank(b.name) - examRank(a.name));
+      const open = covering.find(isOpenExam);
+
+      if (open) {
+        steps.push(`waiting for exam ${open.name}`);
+        waitingFor = open.name;
+      } else if (covering.some((e) => EXAM_DONE.has(e.status))) {
+        steps.push('exam already passed'); // the site will mark this level's exam as covered
       } else {
-        steps.push('exam already sent');
+        step(`${skillLabel}: sending exam ${wanted}...`);
+        await sendExam(wanted, memberId);
+        recordSentExam(selection.license, wanted);
+        log(`  📨 exam "${wanted}" sent to the student`);
+        steps.push(`exam ${wanted} sent`);
+        waitingFor = wanted;
       }
-      waitingForExam = true;
+      waitingForExam = Boolean(waitingFor);
     }
 
     if (startSkill.hasWorkshopTool) {
+      step(`${skillLabel}: reading checklist...`);
       const workshop = await getWorkshopExam(memberId, skillId);
       let done = 0;
       let already = 0;
       let skipped = 0;
       // Sequential on purpose: each save also recomputes the parent chapter on
       // the site, and parallel saves risk duplicate rating records.
+      let n = 0;
       for (const item of workshop.items) {
+        step(`${skillLabel}: checklist ${++n}/${workshop.items.length}`);
         if (item.currentStatus === status) {
           already += 1;
           continue;
@@ -647,6 +736,7 @@
           } else if (!file) {
             missingFiles.push(item.label);
           } else {
+            step(`${skillLabel}: uploading ${item.label}...`);
             await uploadDocument({ memberId, skillId: item.itemId, targetStatus: status, file, mySkillId: item.mySkillId });
             done += 1;
             log(`  📎 ${item.label} - document uploaded`);
@@ -665,6 +755,7 @@
 
     if (startSkill.hasDocumentUpload) {
       if (file) {
+        step(`${skillLabel}: uploading document...`);
         await uploadDocument({ memberId, skillId, targetStatus: status, file, mySkillId: startSkill.mySkillId });
         steps.push('document uploaded');
       } else {
@@ -676,30 +767,33 @@
     if (waitingForExam || missingFiles.length) {
       // Other levels are unaffected, so the panel stays usable for them - but this
       // level's exam/items just changed, so it is stale for the final view.
-      return { steps, waitingForExam, missingFiles, panel, fresh: false };
+      return { steps, waitingForExam, waitingFor, missingFiles, panel, fresh: false };
     }
 
     // Re-read: ticking items is what makes the final status available.
+    step(`${skillLabel}: checking the level...`);
     const livePanel = await getCertifyPanel(memberId);
     const live = findSkill(livePanel, skillLabel);
     if (!live) throw new FlyappiError('level is no longer visible for this pilot');
     if (live.currentStatus === status) {
       steps.push(`level already ${status}`);
-      return { steps, waitingForExam, missingFiles, panel: livePanel, fresh: true };
+      return { steps, waitingForExam, waitingFor: null, missingFiles, panel: livePanel, fresh: true };
     }
     if (live.statutesAvailable.length && !live.statutesAvailable.includes(status)) {
       throw new FlyappiError(`the site does not allow "${status}" yet (available: ${live.statutesAvailable.join(', ') || 'none'}). ${live.message}`);
     }
 
+    step(`${skillLabel}: issuing the level...`);
     await setSkillStatus(memberId, skillId, status, '', live.mySkillId);
     // The site reports success even when it ignores the save, so confirm it.
+    step(`${skillLabel}: confirming...`);
     const after = await getCertifyPanel(memberId);
     const confirmed = findSkill(after, skillLabel);
     if (confirmed?.currentStatus !== status) {
       throw new FlyappiError(`status did not apply (now: ${confirmed?.currentStatus || 'not started'}). ${confirmed?.message || ''}`);
     }
     steps.push(`level → ${status}`);
-    return { steps, waitingForExam, missingFiles, panel: after, fresh: true };
+    return { steps, waitingForExam, waitingFor: null, missingFiles, panel: after, fresh: true };
   }
 
   async function tryCertify(memberId, selection, log, panel) {
@@ -711,13 +805,13 @@
       const message = out.steps.join('; ');
       log(`${skillLabel}: ${message}`, pending ? 'warn' : 'ok');
       return {
-        result: { skillLabel, status: pending ? 'pending' : 'ok', message, waitingForExam: out.waitingForExam, missingFiles: out.missingFiles },
+        result: { skillLabel, status: pending ? 'pending' : 'ok', message, waitingForExam: out.waitingForExam, waitingFor: out.waitingFor, missingFiles: out.missingFiles },
         panel: out.panel,
         fresh: out.fresh,
       };
     } catch (err) {
       log(`${skillLabel}: ${err.message}`, 'error');
-      return { result: { skillLabel, status: 'error', message: err.message, waitingForExam: false, missingFiles: [] }, panel: null, fresh: false };
+      return { result: { skillLabel, status: 'error', message: err.message, waitingForExam: false, waitingFor: null, missingFiles: [] }, panel: null, fresh: false };
     }
   }
 
@@ -729,6 +823,7 @@
    */
   async function applyTarget(licenseNumber, targetSlug, { file, onLog } = {}) {
     const log = (message, level = 'info') => onLog?.(`[${licenseNumber}] ${message}`, level);
+    log('reading the pilot...', 'step');
     const member = await getMember(licenseNumber);
     const results = [];
     let panel = await getCertifyPanel(member.memberId);
@@ -743,12 +838,12 @@
       tried.add(next.slug);
 
       if (!next.visible) {
-        results.push({ skillLabel: next.label, status: 'pending', message: 'not unlocked on the site yet', waitingForExam: false, missingFiles: [] });
+        results.push({ skillLabel: next.label, status: 'pending', message: 'not unlocked on the site yet', waitingForExam: false, waitingFor: null, missingFiles: [] });
         break;
       }
 
       const skill = visibleSkills().find((sk) => sk.slug === next.slug);
-      const out = await tryCertify(member.memberId, { skillLabel: skill.label, file }, log, panel);
+      const out = await tryCertify(member.memberId, { skillLabel: skill.label, file, license: licenseNumber, targetExam: EXAM_BY_SLUG[targetSlug] || null }, log, panel);
       results.push(out.result);
       if (out.panel) {
         panel = out.panel;
@@ -764,6 +859,7 @@
       }
     }
 
+    log('updating the card...', 'step');
     const finalPanel = fresh ? panel : await getCertifyPanel(member.memberId);
     return { results, pilot: await buildView(member, licenseNumber, finalPanel) };
   }
@@ -898,6 +994,7 @@
     if (loadStored(OPEN_KEY, false, sessionStorage)) setOpen(true);
 
     function log(message, level = 'info') {
+      if (level === 'step') return setStep(message);
       const line = el('div', { textContent: `[${new Date().toLocaleTimeString()}] ${message}` });
       line.className = { error: 'err', warn: 'wait', ok: 'ok' }[level] || '';
       logBox.append(line);
@@ -910,6 +1007,37 @@
     let pilots = [];
     let busy = false;
     const anyBusy = () => busy || pilots.some((p) => p.busy);
+
+    // What exactly is happening right now, per pilot: the current step and how long
+    // it has been going. Steps arrive as "[license] text"; a ticking clock updates the lines.
+    function setStep(message) {
+      const m = message.match(/^\[(\d+)\] (.*)$/);
+      const pilot = m && pilots.find((p) => p.license === m[1]);
+      if (!pilot || !pilot.busy) return;
+      pilot.step = m[2];
+      pilot.stepAt = Date.now();
+      paintBusy(pilot);
+    }
+
+    function busyText(pilot) {
+      const secs = Math.round((Date.now() - (pilot.stepAt || Date.now())) / 1000);
+      const slow = secs >= 45 ? ' - the site is slow, still waiting' : '';
+      return `⏳ ${pilot.step || pilot.busy.replace(/^⏳ /, '')}${secs >= 3 ? ` · ${secs} s${slow}` : ''}`;
+    }
+
+    function paintBusy(pilot) {
+      const line = cardsBox.querySelector(`.status[data-license="${pilot.license}"]`);
+      if (line && pilot.busy) line.textContent = busyText(pilot);
+    }
+
+    setInterval(() => pilots.forEach((p) => p.busy && paintBusy(p)), 1000);
+
+    // A phone freezes pages in the background: say so instead of leaving a silent, stuck status.
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible' && anyBusy()) {
+        log('The page was in the background - if a step stays stuck, it was interrupted: press Find to reload the state.', 'warn');
+      }
+    });
 
     // Leaving the page aborts whatever is running - ask first.
     window.addEventListener('beforeunload', (e) => {
@@ -960,14 +1088,15 @@
 
     function resultLine(pilot) {
       if (pilot.error) return { cls: 'err', text: `❌ ${pilot.error}`, title: pilot.error };
-      if (pilot.busy) return { cls: 'wait', text: pilot.busy, title: '' };
+      if (pilot.busy) return { cls: 'wait', text: busyText(pilot), title: '' };
       if (!pilot.results) return null;
       const r = pilot.results;
       const title = r.map((x) => `${x.skillLabel}: ${x.message}`).join('\n');
       const parts = [];
       const errors = r.filter((x) => x.status === 'error');
       if (errors.length) parts.push(`❌ ${errors[0].skillLabel}: ${errors[0].message}`);
-      if (r.some((x) => x.waitingForExam)) parts.push('⏳ waiting for exam');
+      const waiting = [...new Set(r.filter((x) => x.waitingForExam).map((x) => x.waitingFor).filter(Boolean))];
+      if (r.some((x) => x.waitingForExam)) parts.push(`⏳ waiting for exam${waiting.length ? ` ${waiting.join(', ')}` : ''}`);
       if (r.some((x) => x.missingFiles?.length)) parts.push('📎 needs file');
       if (r.some((x) => x.status === 'pending' && /not unlocked/.test(x.message))) parts.push('🔒 next level not unlocked yet');
       if (!parts.length) parts.push(r.length ? '✅ done' : '✅ nothing to do');
@@ -1011,6 +1140,7 @@
       const result = resultLine(pilot);
       if (result) {
         const line = el('div', { className: `status ${result.cls}`, textContent: result.text, title: result.title });
+        line.dataset.license = pilot.license;
         // No hover on a phone: tapping shows the full text.
         if (result.title) line.addEventListener('click', () => alert(result.title));
         card.append(line);
@@ -1035,7 +1165,13 @@
       for (const skill of pilot.skills.filter((s) => s.currentStatus !== 'validated')) {
         if (skill.exam) {
           const e = skill.exam;
-          const [cls, text] = e.isPassed ? ['ok', '🎓 exam passed'] : e.needsSending ? ['err', '📨 exam not sent'] : ['wait', '⏳ exam sent, waiting'];
+          const [cls, text] = e.coveredByBetter
+            ? ['ok', '🎓 covered by a higher exam']
+            : e.isPassed
+              ? ['ok', '🎓 exam passed']
+              : e.needsSending
+                ? ['err', '📨 exam not sent']
+                : ['wait', `⏳ waiting for exam${e.waitingFor ? ` ${e.waitingFor}` : ''}`];
           info.append(el('div', { className: cls, textContent: `${skill.label}: ${text}` }));
         }
         for (const doc of skill.documents) {
@@ -1099,6 +1235,8 @@
     async function uploadFor(pilot, skill, file) {
       if (busy || pilot.busy) return;
       pilot.busy = '⏳ uploading file...';
+      pilot.step = 'uploading file...';
+      pilot.stepAt = Date.now();
       pilot.uploading = skill.label;
       render();
       try {
@@ -1108,12 +1246,15 @@
           if (/document uploaded/.test(message)) {
             pilot.uploaded = true;
             pilot.busy = '⏳ refreshing pilot...';
+            pilot.step = 'file uploaded, refreshing the pilot...';
+            pilot.stepAt = Date.now();
             render();
           }
         };
         pilot.results = await runTarget(pilot, skill.slug, file, onLog);
       } finally {
         pilot.busy = undefined;
+        pilot.step = undefined;
         pilot.uploading = undefined;
         pilot.uploaded = false;
         render();
@@ -1131,7 +1272,7 @@
       store(INPUT_KEY, input.value, sessionStorage);
       input.blur(); // hide the phone keyboard so the cards are visible
       busy = true;
-      pilots = licenses.map((license) => ({ license, skills: [], targets: [], checked: new Set(), busy: 'loading...' }));
+      pilots = licenses.map((license) => ({ license, skills: [], targets: [], checked: new Set(), busy: 'loading...', stepAt: Date.now() }));
       render();
       let loaded = 0;
       const started = Date.now();
@@ -1168,11 +1309,14 @@
         todo,
         async (pilot) => {
           pilot.busy = '⏳ working...';
+          pilot.step = 'starting...';
+          pilot.stepAt = Date.now();
           render();
           const all = [];
           for (const slug of targetsToRun(pilot)) all.push(...(await runTarget(pilot, slug, null)));
           pilot.results = all;
           pilot.busy = undefined;
+          pilot.step = undefined;
           statusText.textContent = `done ${++finished} of ${todo.length}...`;
           render();
         },

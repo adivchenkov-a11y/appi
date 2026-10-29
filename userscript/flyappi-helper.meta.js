@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FlyAPPI Instructor Helper
 // @namespace    flyappi-automation
-// @version      2.1.3
+// @version      2.1.4
 // @description  Issue APPI pilot levels on flyappi.org for one or many pilots at once, from your own logged-in session.
 // @match        https://flyappi.org/*
 // @match        https://www.flyappi.org/*

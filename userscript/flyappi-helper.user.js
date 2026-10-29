@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FlyAPPI Instructor Helper
 // @namespace    flyappi-automation
-// @version      2.1.3
+// @version      2.1.4
 // @description  Issue APPI pilot levels on flyappi.org for one or many pilots at once, from your own logged-in session.
 // @match        https://flyappi.org/*
 // @match        https://www.flyappi.org/*
@@ -15,7 +15,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '2.1.3'; // keep equal to @version (checked by scripts/pack-userscript.js)
+  const VERSION = '2.1.4'; // keep equal to @version (checked by scripts/pack-userscript.js)
   const BASE_URL = location.origin;
   const AJAX_HEADERS = { 'X-Requested-With': 'XMLHttpRequest' };
   const GET_TIMEOUT_MS = 60000;
@@ -70,7 +70,12 @@
     siv: 'SIV',
     advanced_siv: 'Advanced SIV',
     dynamic_soaring: 'Dynamic soaring',
+    thermalling: 'Thermalling',
+    first_aid: 'First aid',
   };
+  // The site names levels in the account's language (a Russian account gets "Термические полеты").
+  // Screens and the log use the English name by slug; the site's own label is kept only to find the level.
+  const displayName = (slug, label) => CHAIN_NAMES[slug] || label;
   // APPI 3 needs ONE of these ratings; the first is what gets issued by default.
   const APPI3_RATINGS = ['dynamic_soaring', 'thermalling'];
   const MAX_STEPS = 6;
@@ -572,7 +577,7 @@
     const bySlug = new Map(skills.map((s) => [s.slug, s]));
     const step = (slug) => {
       const s = bySlug.get(slug);
-      return { slug, label: s?.label || CHAIN_NAMES[slug] || slug, visible: Boolean(s), status: s?.currentStatus || null, exam: s?.exam || null };
+      return { slug, label: displayName(slug, s?.label) || slug, visible: Boolean(s), status: s?.currentStatus || null, exam: s?.exam || null };
     };
 
     const chainId = chainOf(targetSlug);
@@ -606,7 +611,7 @@
       if (!plan.length) continue;
       const s = skills.find((x) => x.slug === slug);
       const chain = chainOf(slug);
-      targets.push({ slug, label: s?.label || CHAIN_NAMES[slug] || slug, plan, chain, order: chain ? CHAINS[chain].indexOf(slug) : -1 });
+      targets.push({ slug, label: displayName(slug, s?.label) || slug, plan, chain, order: chain ? CHAINS[chain].indexOf(slug) : -1 });
     }
     return targets;
   }
@@ -635,7 +640,8 @@
         .map((i) => ({ label: i.label, done: i.currentStatus === 'validated' }));
       if (s.hasDocumentUpload && !documents.length) documents.push({ label: s.label, done: s.currentStatus === 'validated' });
       return {
-        label: s.label,
+        label: s.label, // the site's own label: used to find the level, never shown
+        name: displayName(s.slug, s.label),
         slug: s.slug,
         currentStatus: s.currentStatus,
         exam: withKnownExams(s.exam, exams),
@@ -685,6 +691,7 @@
    */
   async function certifyLevel(memberId, selection, status, log, panel) {
     const { skillLabel, file } = selection;
+    const name = selection.name || skillLabel;
     const step = (text) => log(text, 'step');
     const steps = [];
     const missingFiles = [];
@@ -714,7 +721,7 @@
       } else if (covering.some((e) => EXAM_DONE.has(e.status))) {
         steps.push('exam already passed'); // the site will mark this level's exam as covered
       } else {
-        step(`${skillLabel}: sending exam ${wanted}...`);
+        step(`${name}: sending exam ${wanted}...`);
         await sendExam(wanted, memberId);
         recordSentExam(selection.license, wanted);
         log(`  📨 exam "${wanted}" sent to the student`);
@@ -725,7 +732,7 @@
     }
 
     if (startSkill.hasWorkshopTool) {
-      step(`${skillLabel}: reading checklist...`);
+      step(`${name}: reading checklist...`);
       const workshop = await getWorkshopExam(memberId, skillId);
       let done = 0;
       let already = 0;
@@ -734,7 +741,7 @@
       // the site, and parallel saves risk duplicate rating records.
       let n = 0;
       for (const item of workshop.items) {
-        step(`${skillLabel}: checklist ${++n}/${workshop.items.length}`);
+        step(`${name}: checklist ${++n}/${workshop.items.length}`);
         if (item.currentStatus === status) {
           already += 1;
           continue;
@@ -747,7 +754,7 @@
           } else if (!file) {
             missingFiles.push(item.label);
           } else {
-            step(`${skillLabel}: uploading ${item.label}...`);
+            step(`${name}: uploading ${item.label}...`);
             await uploadDocument({ memberId, skillId: item.itemId, targetStatus: status, file, mySkillId: item.mySkillId });
             done += 1;
             log(`  📎 ${item.label} - document uploaded`);
@@ -766,7 +773,7 @@
 
     if (startSkill.hasDocumentUpload) {
       if (file) {
-        step(`${skillLabel}: uploading document...`);
+        step(`${name}: uploading document...`);
         await uploadDocument({ memberId, skillId, targetStatus: status, file, mySkillId: startSkill.mySkillId });
         steps.push('document uploaded');
       } else {
@@ -782,7 +789,7 @@
     }
 
     // Re-read: ticking items is what makes the final status available.
-    step(`${skillLabel}: checking the level...`);
+    step(`${name}: checking the level...`);
     const livePanel = await getCertifyPanel(memberId);
     const live = findSkill(livePanel, skillLabel);
     if (!live) throw new FlyappiError('level is no longer visible for this pilot');
@@ -794,10 +801,10 @@
       throw new FlyappiError(`the site does not allow "${status}" yet (available: ${live.statutesAvailable.join(', ') || 'none'}). ${live.message}`);
     }
 
-    step(`${skillLabel}: issuing the level...`);
+    step(`${name}: issuing the level...`);
     await setSkillStatus(memberId, skillId, status, '', live.mySkillId);
     // The site reports success even when it ignores the save, so confirm it.
-    step(`${skillLabel}: confirming...`);
+    step(`${name}: confirming...`);
     const after = await getCertifyPanel(memberId);
     const confirmed = findSkill(after, skillLabel);
     if (confirmed?.currentStatus !== status) {
@@ -809,20 +816,21 @@
 
   async function tryCertify(memberId, selection, log, panel) {
     const { skillLabel } = selection;
-    log(`${skillLabel}: starting...`);
+    const name = selection.name || skillLabel;
+    log(`${name}: starting...`);
     try {
       const out = await certifyLevel(memberId, selection, 'validated', log, panel);
       const pending = out.waitingForExam || out.missingFiles.length > 0;
       const message = out.steps.join('; ');
-      log(`${skillLabel}: ${message}`, pending ? 'warn' : 'ok');
+      log(`${name}: ${message}`, pending ? 'warn' : 'ok');
       return {
-        result: { skillLabel, status: pending ? 'pending' : 'ok', message, waitingForExam: out.waitingForExam, waitingFor: out.waitingFor, missingFiles: out.missingFiles },
+        result: { skillLabel: name, status: pending ? 'pending' : 'ok', message, waitingForExam: out.waitingForExam, waitingFor: out.waitingFor, missingFiles: out.missingFiles },
         panel: out.panel,
         fresh: out.fresh,
       };
     } catch (err) {
-      log(`${skillLabel}: ${err.message}`, 'error');
-      return { result: { skillLabel, status: 'error', message: err.message, waitingForExam: false, waitingFor: null, missingFiles: [] }, panel: null, fresh: false };
+      log(`${name}: ${err.message}`, 'error');
+      return { result: { skillLabel: name, status: 'error', message: err.message, waitingForExam: false, waitingFor: null, missingFiles: [] }, panel: null, fresh: false };
     }
   }
 
@@ -854,7 +862,7 @@
       }
 
       const skill = visibleSkills().find((sk) => sk.slug === next.slug);
-      const out = await tryCertify(member.memberId, { skillLabel: skill.label, file, license: licenseNumber, targetExam: EXAM_BY_SLUG[targetSlug] || null }, log, panel);
+      const out = await tryCertify(member.memberId, { skillLabel: skill.label, name: displayName(skill.slug, skill.label), file, license: licenseNumber, targetExam: EXAM_BY_SLUG[targetSlug] || null }, log, panel);
       results.push(out.result);
       if (out.panel) {
         panel = out.panel;
@@ -888,13 +896,14 @@
     const panel = await getCertifyPanel(member.memberId);
     const skill = findSkill(panel, skillLabel);
     if (!skill) throw new FlyappiError(`level "${skillLabel}" is not available for this pilot`);
+    const name = displayName(skill.slug, skill.label);
     let uploaded = 0;
     if (skill.hasWorkshopTool) {
-      log(`${skill.label}: reading checklist...`, 'step');
+      log(`${name}: reading checklist...`, 'step');
       const { items } = await getWorkshopExam(member.memberId, skill.skillId);
       for (const item of items) {
         if (!item.needsDocument || item.currentStatus === 'validated' || isInheritedDocument(item.label, skill.label)) continue;
-        log(`${skill.label}: uploading ${item.label}...`, 'step');
+        log(`${name}: uploading ${item.label}...`, 'step');
         await uploadDocument({ memberId: member.memberId, skillId: item.itemId, targetStatus: 'validated', file, mySkillId: item.mySkillId });
         log(`  📎 ${item.label} - document uploaded`, 'ok');
         uploaded += 1;
@@ -902,9 +911,9 @@
     }
     // A level-wide document is only asked for when no checklist row needs one (same rule as the card).
     if (!uploaded && skill.hasDocumentUpload && skill.currentStatus !== 'validated') {
-      log(`${skill.label}: uploading document...`, 'step');
+      log(`${name}: uploading document...`, 'step');
       await uploadDocument({ memberId: member.memberId, skillId: skill.skillId, targetStatus: 'validated', file, mySkillId: skill.mySkillId });
-      log(`  📎 ${skill.label} - document uploaded`, 'ok');
+      log(`  📎 ${name} - document uploaded`, 'ok');
       uploaded += 1;
     }
     if (!uploaded) throw new FlyappiError('this level does not ask for a file any more');
@@ -1235,10 +1244,10 @@
               : e.needsSending
                 ? ['err', '📨 exam not sent']
                 : ['wait', `⏳ waiting for exam${e.waitingFor ? ` ${e.waitingFor}` : ''}`];
-          info.append(el('div', { className: cls, textContent: `${skill.label}: ${text}` }));
+          info.append(el('div', { className: cls, textContent: `${skill.name}: ${text}` }));
         }
         for (const doc of skill.documents) {
-          info.append(el('div', { className: doc.done ? 'ok' : 'err', textContent: `${skill.label}: ${doc.done ? '📗 file uploaded' : '📎 file missing'} (${doc.label})` }));
+          info.append(el('div', { className: doc.done ? 'ok' : 'err', textContent: `${skill.name}: ${doc.done ? '📗 file uploaded' : '📎 file missing'} (${doc.label})` }));
         }
       }
       if (info.childNodes.length) card.append(info);
@@ -1246,18 +1255,18 @@
       const files = el('div', { className: 'files' });
       for (const skill of pilot.skills.filter((s) => (s.needsFile || pilot.uploading === s.label) && s.currentStatus !== 'validated')) {
         if (pilot.uploading === skill.label) {
-          const text = pilot.uploaded ? `✅ File uploaded, issuing the level... · ${skill.label}` : `⏳ Uploading... · ${skill.label}`;
+          const text = pilot.uploaded ? `✅ File uploaded, issuing the level... · ${skill.name}` : `⏳ Uploading... · ${skill.name}`;
           files.append(el('span', { className: 'file-btn file-busy', textContent: text }));
           continue;
         }
         const locked = busy || Boolean(pilot.busy);
         const fileInput = el('input', { type: 'file', disabled: locked });
         fileInput.addEventListener('change', () => fileInput.files[0] && uploadFor(pilot, skill, fileInput.files[0]));
-        files.append(el('label', { className: `file-btn${locked ? ' file-disabled' : ''}` }, `📎 Upload file · ${skill.label}`, fileInput));
+        files.append(el('label', { className: `file-btn${locked ? ' file-disabled' : ''}` }, `📎 Upload file · ${skill.name}`, fileInput));
       }
       if (files.childNodes.length) card.append(files);
 
-      const issued = pilot.skills.filter((s) => s.currentStatus === 'validated').map((s) => s.label);
+      const issued = pilot.skills.filter((s) => s.currentStatus === 'validated').map((s) => s.name);
       if (issued.length) card.append(el('div', { className: 'issued', textContent: `✅ ${issued.join(', ')}` }));
       return card;
     }
@@ -1298,7 +1307,7 @@
     async function uploadFor(pilot, skill, file) {
       if (busy || pilot.busy) return;
       pilot.busy = '⏳ uploading file...';
-      pilot.step = `${skill.label}: uploading file...`;
+      pilot.step = `${skill.name}: uploading file...`;
       pilot.stepAt = Date.now();
       pilot.uploading = skill.label;
       render();
@@ -1306,8 +1315,8 @@
         try {
           await uploadLevelFile(pilot.license, skill.label, file, { onLog: log });
         } catch (err) {
-          log(`[${pilot.license}] ${skill.label}: file upload failed - ${err.message}`, 'error');
-          pilot.results = [{ skillLabel: skill.label, status: 'error', message: `file upload failed - ${err.message}` }];
+          log(`[${pilot.license}] ${skill.name}: file upload failed - ${err.message}`, 'error');
+          pilot.results = [{ skillLabel: skill.name, status: 'error', message: `file upload failed - ${err.message}` }];
           return;
         }
         pilot.uploaded = true;
@@ -1319,7 +1328,7 @@
         }
         render();
         const issued = await runTarget(pilot, skill.slug, null);
-        pilot.results = [{ skillLabel: skill.label, status: 'ok', message: 'file uploaded', fileUploaded: true }, ...issued];
+        pilot.results = [{ skillLabel: skill.name, status: 'ok', message: 'file uploaded', fileUploaded: true }, ...issued];
       } finally {
         pilot.busy = undefined;
         pilot.step = undefined;
